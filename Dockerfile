@@ -13,8 +13,8 @@ RUN npm install --omit=dev
 # Copy the worker
 COPY --chown=user . .
 
-# Suga injects PORT; default to 8080
-ENV PORT=8080
+# Do NOT set ENV PORT here — Suga injects it at runtime.
+# Your worker falls back to 8080 if none is provided.
 EXPOSE 8080
 
 CMD ["node", "worker.js"]
