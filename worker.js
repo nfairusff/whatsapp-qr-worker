@@ -8,7 +8,6 @@ import makeWASocket, {
 } from '@whiskeysockets/baileys';
 import { createClient } from '@supabase/supabase-js';
 import fs from 'fs/promises';
-import path from 'path';
 
 const PORT = process.env.PORT || 8080;
 
@@ -189,8 +188,10 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  /* ---- health check ---- */
-  if (req.method === 'GET' && req.url === '/health') {
+  /* ---- health check (root + /health) ---- */
+  // Suga (and most platforms) probe '/' to check container health.
+  // Returning 200 on both prevents unnecessary restarts.
+  if (req.method === 'GET' && (req.url === '/' || req.url === '/health')) {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       status: 'ok',
@@ -232,6 +233,7 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, '0.0.0.0', () => {
+  console.log('PORT env value:', process.env.PORT, '| using:', PORT);
   console.log(`Worker listening on 0.0.0.0:${PORT}`);
 });
 
