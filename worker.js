@@ -9,9 +9,24 @@ import makeWASocket, {
 import { createClient } from '@supabase/supabase-js';
 import fs from 'fs/promises';
 
+/* ------------------------------------------------------------------ */
+/* Diagnostics — remove once routing is confirmed working              */
+/* ------------------------------------------------------------------ */
+
+console.log('--- ENV DUMP ---');
+for (const [k, v] of Object.entries(process.env)) {
+  if (/PORT|HOST|URL|SUGA|PROXY|NODE_ENV/i.test(k)) {
+    console.log(`${k}=${v}`);
+  }
+}
+console.log('--- END ENV ---');
+
+/* ------------------------------------------------------------------ */
+/* Config                                                              */
+/* ------------------------------------------------------------------ */
+
 const PORT = process.env.PORT || 8080;
 
-// --- Supabase config (set as environment variables) ---
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
@@ -22,7 +37,7 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 
-// --- Active sessions map (sessionId -> { sock, dir, timeout }) ---
+// sessionId -> { sock, dir, timeout }
 const activeSessions = new Map();
 
 /* ------------------------------------------------------------------ */
@@ -55,7 +70,7 @@ async function updateRow(sessionId, fields) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Start a pairing session                                             */
+/* Pairing session                                                     */
 /* ------------------------------------------------------------------ */
 
 async function startPairingSession(sessionId) {
@@ -126,7 +141,6 @@ async function startPairingSession(sessionId) {
       const current = await readRow(sessionId);
       const payload = parsePayload(current?.isiPermohonan);
 
-      // Write phone + status='paired'
       await updateRow(sessionId, {
         statusLaporan: 'paired',
         isiPermohonan: JSON.stringify({ ...payload, phone }),
@@ -150,7 +164,6 @@ async function startPairingSession(sessionId) {
         console.error(`[${sessionId}] complete-pairing fetch failed:`, err);
       }
 
-      // Close and clean up
       try { await sock.logout(); } catch { /* ignore */ }
       await fs.rm(sessionDir, { recursive: true, force: true });
       activeSessions.delete(sessionId);
@@ -188,19 +201,19 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  /* ---- health check (root + /health) ---- */
-  // Suga (and most platforms) probe '/' to check container health.
-  // Returning 200 on both prevents unnecessary restarts.
+  /* ---- health check: both / and /health return 200 ---- */
+  // Suga's health probe hits '/'. Returning 200 prevents restart loops.
   if (req.method === 'GET' && (req.url === '/' || req.url === '/health')) {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       status: 'ok',
       active: activeSessions.size,
+      port: PORT,
     }));
     return;
   }
 
-  /* ---- start a pairing session ---- */
+  /* ---- start pairing ---- */
   if (req.method === 'POST' && req.url === '/start-session') {
     let body = '';
     req.on('data', (chunk) => (body += chunk));
@@ -213,10 +226,10 @@ const server = http.createServer(async (req, res) => {
           return;
         }
 
+        // Respond first, then run the async work
         res.writeHead(202, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ success: true, sessionId }));
 
-        // Fire-and-forget; the response is already sent
         startPairingSession(sessionId).catch((err) => {
           console.error(`[${sessionId}] startPairingSession failed:`, err);
         });
@@ -238,12 +251,12 @@ server.listen(PORT, '0.0.0.0', () => {
 });
 
 /* ------------------------------------------------------------------ */
-/* Cleanup on shutdown                                                 */
+/* Graceful shutdown                                                   */
 /* ------------------------------------------------------------------ */
 
 process.on('SIGTERM', async () => {
   console.log('SIGTERM — cleaning up sessions');
-  for (const [sessionId, entry] of activeSessions) {
+  for (const [, entry] of activeSessions) {
     try { await entry.sock.end(undefined); } catch { /* ignore */ }
     try { await fs.rm(entry.dir, { recursive: true, force: true }); } catch { /* ignore */ }
   }
