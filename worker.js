@@ -1,5 +1,5 @@
 // worker.js — WhatsApp QR pairing worker
-// Deployed as a web service (Suga / any Docker host)
+// Deployed as a web service  (Suga / any Docker host)
 
 import http from 'http';
 import makeWASocket, {
