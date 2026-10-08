@@ -23,24 +23,45 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
   process.exit(1);
 }
 
-console.log('Worker booting. SUPABASE_URL host:', new URL(SUPABASE_URL).hostname);
+/**
+ * KEEP_WA_LINKED=false (default)
+ *   Verification-only. After capturing the phone number, the worker
+ *   calls sock.logout() to unlink the device and deletes the creds.
+ *   Matches the schema where activationMedia = verified phone number.
+ *
+ * KEEP_WA_LINKED=true
+ *   Keep the WhatsApp link alive so the worker can send messages later.
+ *   The socket stays open and creds stay on disk.
+ */
+const KEEP_WA_LINKED = process.env.KEEP_WA_LINKED === 'true';
+
+// How long to wait for creds to flush before reconnecting after a 515.
+const RESTART_DELAY_MS = 1500;
+
+// Max 515 reconnects before giving up.
+const MAX_RESTARTS = 3;
+
+// Time the user has to scan the QR.
+const SESSION_TIMEOUT_MS = 120_000;
+
+console.log(
+  `Worker booting. target=${new URL(SUPABASE_URL).hostname} keepLinked=${KEEP_WA_LINKED}`,
+);
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 
-// sessionId -> { sock, dir, timeout }
+// sessionId -> { sock, dir, timeout, paired, completed, restarts }
 const activeSessions = new Map();
 
 /* ------------------------------------------------------------------ */
-/* Helpers                                                             */
+/* DB helpers                                                          */
 /* ------------------------------------------------------------------ */
 
 function parsePayload(raw) {
   if (raw == null) return {};
   if (typeof raw === 'string') {
-    try {
-      return JSON.parse(raw);
-    } catch (err) {
-      console.warn('parsePayload: malformed JSON, treating as empty:', err.message);
+    try { return JSON.parse(raw); } catch (err) {
+      console.warn('parsePayload: malformed JSON:', err.message);
       return {};
     }
   }
@@ -63,10 +84,6 @@ async function readRow(sessionId) {
   return data;
 }
 
-/**
- * Returns { ok: true } or { ok: false, error }.
- * Callers MUST check, otherwise writes fail silently.
- */
 async function updateRow(sessionId, fields) {
   const { error } = await supabase
     .from('LaporanAkun')
@@ -89,7 +106,15 @@ async function updateRow(sessionId, fields) {
   return { ok: true };
 }
 
-async function cleanupSession(sessionId, { endSocket = true } = {}) {
+/* ------------------------------------------------------------------ */
+/* Session state                                                       */
+/* ------------------------------------------------------------------ */
+
+function getSession(sessionId) {
+  return activeSessions.get(sessionId) ?? null;
+}
+
+async function destroySession(sessionId, { endSocket = true, removeDir = true } = {}) {
   const entry = activeSessions.get(sessionId);
   if (!entry) return;
 
@@ -99,23 +124,31 @@ async function cleanupSession(sessionId, { endSocket = true } = {}) {
   if (endSocket) {
     try { await entry.sock.end(undefined); } catch { /* ignore */ }
   }
-  try { await fs.rm(entry.dir, { recursive: true, force: true }); } catch { /* ignore */ }
+  if (removeDir) {
+    try { await fs.rm(entry.dir, { recursive: true, force: true }); } catch { /* ignore */ }
+  }
 }
 
 /* ------------------------------------------------------------------ */
 /* Pairing session                                                     */
 /* ------------------------------------------------------------------ */
 
-async function startPairingSession(sessionId) {
-  if (activeSessions.has(sessionId)) {
-    console.log(`[${sessionId}] already active, skipping`);
-    return;
-  }
-
-  const row = await readRow(sessionId);
-  if (!row) {
-    console.warn(`[${sessionId}] row not found, aborting`);
-    return;
+async function startPairingSession(sessionId, restarts = 0) {
+  const existing = getSession(sessionId);
+  if (existing) {
+    console.log(`[${sessionId}] restarting session (restart #${restarts})`);
+    if (existing.timeout) clearTimeout(existing.timeout);
+    try { await existing.sock.end(undefined); } catch { /* ignore */ }
+    activeSessions.delete(sessionId);
+    // Don't delete the dir — the creds on disk are exactly what we need
+    // to reconnect without re-scanning.
+  } else {
+    // Fresh session — verify the row exists.
+    const row = await readRow(sessionId);
+    if (!row) {
+      console.warn(`[${sessionId}] row not found, aborting`);
+      return;
+    }
   }
 
   const sessionDir = `./sessions/${sessionId}`;
@@ -129,78 +162,77 @@ async function startPairingSession(sessionId) {
     browser: ['Ubuntu', 'Chrome', '20.0.0'],
   });
 
-  // Register BEFORE wiring listeners so any sync close event can find us.
-  const timeout = setTimeout(async () => {
+  const entry = {
+    sock,
+    dir: sessionDir,
+    timeout: null,
+    paired: false,
+    completed: false,
+    restarts,
+  };
+
+  entry.timeout = setTimeout(async () => {
+    const current = getSession(sessionId);
+    if (!current || current.completed || current.paired) return;
     console.log(`[${sessionId}] timeout, cleaning up`);
     await updateRow(sessionId, { statusLaporan: 'expired' });
-    await cleanupSession(sessionId);
-  }, 120_000);
+    await destroySession(sessionId);
+  }, SESSION_TIMEOUT_MS);
 
-  activeSessions.set(sessionId, { sock, dir: sessionDir, timeout });
+  activeSessions.set(sessionId, entry);
 
   sock.ev.on('creds.update', saveCreds);
 
   sock.ev.on('connection.update', async (update) => {
     const { connection, qr, lastDisconnect } = update;
 
+    const current = getSession(sessionId);
+    if (!current) return; // destroyed by cancel/timeout
+
     /* ---- QR emitted ---- */
-    if (qr) {
+    if (qr && !current.paired) {
       console.log(`[${sessionId}] QR emitted (length=${qr.length})`);
-
-      const current = await readRow(sessionId);
-      const payload = parsePayload(current?.isiPermohonan);
-      const next = { ...payload, qr };
-      const nextJson = JSON.stringify(next);
-
-      console.log(
-        `[${sessionId}] writing isiPermohonan bytes=${nextJson.length} hasQr=${'qr' in next}`,
-      );
-
+      const row = await readRow(sessionId);
+      const payload = parsePayload(row?.isiPermohonan);
+      const nextJson = JSON.stringify({ ...payload, qr });
       const write = await updateRow(sessionId, {
         statusLaporan: 'qr_ready',
         isiPermohonan: nextJson,
       });
-
-      if (!write.ok) {
-        // At this point statusLaporan may still have landed (PostgREST
-        // applies updates atomically, so it shouldn't, but the log will
-        // tell us exactly what went wrong).
-        console.error(`[${sessionId}] QR write failed — see updateRow log above`);
-        return;
+      if (write.ok) {
+        console.log(`[${sessionId}] qr_ready written (${nextJson.length} bytes)`);
       }
-
-      // Verify the QR actually persisted.
-      const verify = await readRow(sessionId);
-      const verified = parsePayload(verify?.isiPermohonan);
-      console.log(
-        `[${sessionId}] verify: status=${verify?.statusLaporan} hasQr=${!!verified.qr} qrLen=${verified.qr?.length ?? 0}`,
-      );
     }
 
     /* ---- Pairing complete ---- */
     if (connection === 'open') {
-      await cleanupSession(sessionId, { endSocket: false });
+      current.paired = true;
+      if (current.timeout) {
+        clearTimeout(current.timeout);
+        current.timeout = null;
+      }
 
       const jid = sock.user?.id;
       const phone = jid?.split(':')[0]?.split('@')[0];
-      console.log(`[${sessionId}] paired with phone ${phone}`);
+      console.log(`[${sessionId}] connection open, phone=${phone}`);
 
       if (!phone) {
         console.error(`[${sessionId}] no phone in JID, aborting`);
         try { await sock.logout(); } catch { /* ignore */ }
-        await fs.rm(sessionDir, { recursive: true, force: true });
-        activeSessions.delete(sessionId);
+        await destroySession(sessionId);
         return;
       }
 
-      const current = await readRow(sessionId);
-      const payload = parsePayload(current?.isiPermohonan);
+      const row = await readRow(sessionId);
+      const payload = parsePayload(row?.isiPermohonan);
 
       await updateRow(sessionId, {
         statusLaporan: 'paired',
         isiPermohonan: JSON.stringify({ ...payload, phone }),
       });
 
+      // Ask the Edge Function to create the akunPengguna row and flip
+      // the session to 'Aktif'.
       try {
         const url = `${SUPABASE_URL}/functions/v1/REST-function?action=complete-pairing`;
         const res = await fetch(url, {
@@ -218,20 +250,67 @@ async function startPairingSession(sessionId) {
         console.error(`[${sessionId}] complete-pairing fetch failed:`, err);
       }
 
-      try { await sock.logout(); } catch { /* ignore */ }
-      await fs.rm(sessionDir, { recursive: true, force: true });
-      activeSessions.delete(sessionId);
+      current.completed = true;
+
+      if (KEEP_WA_LINKED) {
+        console.log(`[${sessionId}] keeping WA link alive (KEEP_WA_LINKED=true)`);
+        // Socket stays open, creds stay on disk. Session stays in
+        // activeSessions so SIGTERM can shut it down cleanly.
+      } else {
+        console.log(`[${sessionId}] unlinking device (verification-only)`);
+        try { await sock.logout(); } catch { /* ignore */ }
+        await destroySession(sessionId);
+      }
+      return;
     }
 
     /* ---- Connection dropped ---- */
     if (connection === 'close') {
       const code = lastDisconnect?.error?.output?.statusCode;
-      const stillActive = activeSessions.has(sessionId);
-      if (code !== DisconnectReason.loggedOut && stillActive) {
-        console.log(`[${sessionId}] connection closed (code ${code})`);
-        await updateRow(sessionId, { statusLaporan: 'abandoned' });
-        await cleanupSession(sessionId);
+
+      if (current.completed) {
+        // We already finished. A close after that is either the logout
+        // we triggered ourselves, or a benign post-completion drop.
+        console.log(`[${sessionId}] close after completion (code ${code}), ignoring`);
+        return;
       }
+
+      // 515 = "restart required". This is the signal WhatsApp sends
+      // right after a successful QR scan. It is NOT a failure.
+      if (code === 515) {
+        if (current.restarts >= MAX_RESTARTS) {
+          console.error(
+            `[${sessionId}] exceeded max restarts (${MAX_RESTARTS}), abandoning`,
+          );
+          await updateRow(sessionId, { statusLaporan: 'abandoned' });
+          await destroySession(sessionId);
+          return;
+        }
+        const nextRestarts = current.restarts + 1;
+        console.log(
+          `[${sessionId}] 515 restart required, reconnecting (#${nextRestarts}/${MAX_RESTARTS})`,
+        );
+        // Give creds.update time to flush to disk before we reconnect.
+        setTimeout(() => {
+          startPairingSession(sessionId, nextRestarts).catch((err) => {
+            console.error(`[${sessionId}] restart failed:`, err);
+          });
+        }, RESTART_DELAY_MS);
+        return;
+      }
+
+      // 401 = explicitly logged out. Terminal.
+      if (code === DisconnectReason.loggedOut) {
+        console.log(`[${sessionId}] logged out (code 401), abandoning`);
+        await updateRow(sessionId, { statusLaporan: 'abandoned' });
+        await destroySession(sessionId);
+        return;
+      }
+
+      // Anything else before pairing = abandoned.
+      console.log(`[${sessionId}] close (code ${code}), abandoning`);
+      await updateRow(sessionId, { statusLaporan: 'abandoned' });
+      await destroySession(sessionId);
     }
   });
 }
@@ -256,6 +335,7 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify({
       status: 'ok',
       active: activeSessions.size,
+      keepLinked: KEEP_WA_LINKED,
       port: PORT,
     }));
     return;
@@ -276,10 +356,10 @@ const server = http.createServer(async (req, res) => {
         res.writeHead(202, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ success: true, sessionId }));
 
-        startPairingSession(sessionId).catch((err) => {
+        startPairingSession(sessionId, 0).catch((err) => {
           console.error(`[${sessionId}] startPairingSession failed:`, err);
         });
-      } catch (err) {
+      } catch {
         res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'Invalid JSON' }));
       }
@@ -295,7 +375,7 @@ const server = http.createServer(async (req, res) => {
         const { sessionId } = JSON.parse(body || '{}');
         if (sessionId && activeSessions.has(sessionId)) {
           await updateRow(sessionId, { statusLaporan: 'abandoned' });
-          await cleanupSession(sessionId);
+          await destroySession(sessionId);
         }
         res.writeHead(204);
         res.end();
@@ -323,7 +403,7 @@ process.on('SIGTERM', async () => {
   console.log('SIGTERM — cleaning up sessions');
   const ids = [...activeSessions.keys()];
   for (const id of ids) {
-    await cleanupSession(id);
+    await destroySession(id);
   }
   process.exit(0);
 });
