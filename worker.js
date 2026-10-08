@@ -1,5 +1,5 @@
-// worker.js — WhatsApp QR pairing worker
-// Deployed as a web service  (Suga / any Docker host)
+// worker.js — WhatsApp verification worker (verification-only)
+// Every request requires X-Worker-Secret. Never exposed to browsers.
 
 import http from 'http';
 import makeWASocket, {
@@ -17,41 +17,39 @@ const PORT = process.env.PORT || 8080;
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const WORKER_SHARED_SECRET = process.env.WORKER_SHARED_SECRET;
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
-  console.error('Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY');
+  console.error('FATAL: missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY');
+  process.exit(1);
+}
+if (!WORKER_SHARED_SECRET || WORKER_SHARED_SECRET.length < 32) {
+  console.error('FATAL: WORKER_SHARED_SECRET missing or too short (min 32 chars)');
   process.exit(1);
 }
 
-/**
- * KEEP_WA_LINKED=false (default)
- *   Verification-only. After capturing the phone number, the worker
- *   calls sock.logout() to unlink the device and deletes the creds.
- *   Matches the schema where activationMedia = verified phone number.
- *
- * KEEP_WA_LINKED=true
- *   Keep the WhatsApp link alive so the worker can send messages later.
- *   The socket stays open and creds stay on disk.
- */
-const KEEP_WA_LINKED = process.env.KEEP_WA_LINKED === 'true';
-
-// How long to wait for creds to flush before reconnecting after a 515.
+const SESSION_TIMEOUT_MS = 90_000;
+const MAX_RESTARTS = 1;
 const RESTART_DELAY_MS = 1500;
+const MAX_ACTIVE_SESSIONS = 20;
 
-// Max 515 reconnects before giving up.
-const MAX_RESTARTS = 3;
-
-// Time the user has to scan the QR.
-const SESSION_TIMEOUT_MS = 120_000;
-
-console.log(
-  `Worker booting. target=${new URL(SUPABASE_URL).hostname} keepLinked=${KEEP_WA_LINKED}`,
-);
+console.log(`Worker booting. supabase=${new URL(SUPABASE_URL).hostname}`);
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
-
-// sessionId -> { sock, dir, timeout, paired, completed, restarts }
 const activeSessions = new Map();
+
+/* ------------------------------------------------------------------ */
+/* Audit log                                                           */
+/* ------------------------------------------------------------------ */
+
+function audit(sessionId, event, extra = {}) {
+  console.log(JSON.stringify({
+    t: new Date().toISOString(),
+    sessionId,
+    event,
+    ...extra,
+  }));
+}
 
 /* ------------------------------------------------------------------ */
 /* DB helpers                                                          */
@@ -60,10 +58,7 @@ const activeSessions = new Map();
 function parsePayload(raw) {
   if (raw == null) return {};
   if (typeof raw === 'string') {
-    try { return JSON.parse(raw); } catch (err) {
-      console.warn('parsePayload: malformed JSON:', err.message);
-      return {};
-    }
+    try { return JSON.parse(raw); } catch { return {}; }
   }
   if (typeof raw === 'object') return raw;
   return {};
@@ -76,11 +71,7 @@ async function readRow(sessionId) {
     .eq('jenisPermohonan', sessionId)
     .limit(1)
     .maybeSingle();
-
-  if (error) {
-    console.error(`[${sessionId}] readRow error:`, error.message, error.details ?? '');
-    return null;
-  }
+  if (error) return null;
   return data;
 }
 
@@ -89,25 +80,15 @@ async function updateRow(sessionId, fields) {
     .from('LaporanAkun')
     .update(fields)
     .eq('jenisPermohonan', sessionId);
-
   if (error) {
-    console.error(
-      `[${sessionId}] updateRow FAILED`,
-      JSON.stringify({
-        message: error.message,
-        details: error.details,
-        hint: error.hint,
-        code: error.code,
-        fields: Object.keys(fields),
-      }),
-    );
-    return { ok: false, error };
+    audit(sessionId, 'db_update_failed', { code: error.code, message: error.message });
+    return false;
   }
-  return { ok: true };
+  return true;
 }
 
 /* ------------------------------------------------------------------ */
-/* Session state                                                       */
+/* Session lifecycle                                                   */
 /* ------------------------------------------------------------------ */
 
 function getSession(sessionId) {
@@ -127,28 +108,37 @@ async function destroySession(sessionId, { endSocket = true, removeDir = true } 
   if (removeDir) {
     try { await fs.rm(entry.dir, { recursive: true, force: true }); } catch { /* ignore */ }
   }
+  audit(sessionId, 'session_destroyed', { lifetimeMs: Date.now() - entry.startedAt });
 }
 
-/* ------------------------------------------------------------------ */
-/* Pairing session                                                     */
-/* ------------------------------------------------------------------ */
-
 async function startPairingSession(sessionId, restarts = 0) {
-  const existing = getSession(sessionId);
-  if (existing) {
-    console.log(`[${sessionId}] restarting session (restart #${restarts})`);
-    if (existing.timeout) clearTimeout(existing.timeout);
-    try { await existing.sock.end(undefined); } catch { /* ignore */ }
-    activeSessions.delete(sessionId);
-    // Don't delete the dir — the creds on disk are exactly what we need
-    // to reconnect without re-scanning.
-  } else {
-    // Fresh session — verify the row exists.
-    const row = await readRow(sessionId);
-    if (!row) {
-      console.warn(`[${sessionId}] row not found, aborting`);
+  if (restarts === 0) {
+    if (activeSessions.size >= MAX_ACTIVE_SESSIONS) {
+      audit(sessionId, 'rejected_concurrency_limit', { active: activeSessions.size });
       return;
     }
+    const row = await readRow(sessionId);
+    if (!row) {
+      audit(sessionId, 'rejected_row_missing');
+      return;
+    }
+    if (row.statusLaporan !== 'pending') {
+      audit(sessionId, 'rejected_bad_status', { status: row.statusLaporan });
+      return;
+    }
+    if (!await updateRow(sessionId, { statusLaporan: 'starting' })) {
+      audit(sessionId, 'rejected_mark_starting_failed');
+      return;
+    }
+    audit(sessionId, 'session_starting');
+  } else {
+    const existing = getSession(sessionId);
+    if (existing) {
+      if (existing.timeout) clearTimeout(existing.timeout);
+      try { await existing.sock.end(undefined); } catch { /* ignore */ }
+      activeSessions.delete(sessionId);
+    }
+    audit(sessionId, 'session_restarting', { restart: restarts });
   }
 
   const sessionDir = `./sessions/${sessionId}`;
@@ -169,12 +159,13 @@ async function startPairingSession(sessionId, restarts = 0) {
     paired: false,
     completed: false,
     restarts,
+    startedAt: Date.now(),
   };
 
   entry.timeout = setTimeout(async () => {
     const current = getSession(sessionId);
     if (!current || current.completed || current.paired) return;
-    console.log(`[${sessionId}] timeout, cleaning up`);
+    audit(sessionId, 'session_timeout');
     await updateRow(sessionId, { statusLaporan: 'expired' });
     await destroySession(sessionId);
   }, SESSION_TIMEOUT_MS);
@@ -185,26 +176,19 @@ async function startPairingSession(sessionId, restarts = 0) {
 
   sock.ev.on('connection.update', async (update) => {
     const { connection, qr, lastDisconnect } = update;
-
     const current = getSession(sessionId);
-    if (!current) return; // destroyed by cancel/timeout
+    if (!current) return;
 
-    /* ---- QR emitted ---- */
     if (qr && !current.paired) {
-      console.log(`[${sessionId}] QR emitted (length=${qr.length})`);
       const row = await readRow(sessionId);
       const payload = parsePayload(row?.isiPermohonan);
-      const nextJson = JSON.stringify({ ...payload, qr });
-      const write = await updateRow(sessionId, {
+      await updateRow(sessionId, {
         statusLaporan: 'qr_ready',
-        isiPermohonan: nextJson,
+        isiPermohonan: JSON.stringify({ ...payload, qr }),
       });
-      if (write.ok) {
-        console.log(`[${sessionId}] qr_ready written (${nextJson.length} bytes)`);
-      }
+      audit(sessionId, 'qr_emitted', { qrLen: qr.length });
     }
 
-    /* ---- Pairing complete ---- */
     if (connection === 'open') {
       current.paired = true;
       if (current.timeout) {
@@ -214,25 +198,23 @@ async function startPairingSession(sessionId, restarts = 0) {
 
       const jid = sock.user?.id;
       const phone = jid?.split(':')[0]?.split('@')[0];
-      console.log(`[${sessionId}] connection open, phone=${phone}`);
+      audit(sessionId, 'connection_open', { phone });
 
       if (!phone) {
-        console.error(`[${sessionId}] no phone in JID, aborting`);
+        audit(sessionId, 'no_phone_in_jid');
         try { await sock.logout(); } catch { /* ignore */ }
+        await updateRow(sessionId, { statusLaporan: 'abandoned' });
         await destroySession(sessionId);
         return;
       }
 
       const row = await readRow(sessionId);
       const payload = parsePayload(row?.isiPermohonan);
-
       await updateRow(sessionId, {
         statusLaporan: 'paired',
         isiPermohonan: JSON.stringify({ ...payload, phone }),
       });
 
-      // Ask the Edge Function to create the akunPengguna row and flip
-      // the session to 'Aktif'.
       try {
         const url = `${SUPABASE_URL}/functions/v1/REST-function?action=complete-pairing`;
         const res = await fetch(url, {
@@ -241,74 +223,52 @@ async function startPairingSession(sessionId, restarts = 0) {
             'Content-Type': 'application/json',
             Authorization: `Bearer ${SUPABASE_SERVICE_KEY}`,
             apikey: SUPABASE_SERVICE_KEY,
+            'X-Worker-Secret': WORKER_SHARED_SECRET,
           },
           body: JSON.stringify({ sessionId }),
         });
-        const text = await res.text();
-        console.log(`[${sessionId}] complete-pairing -> ${res.status} ${text}`);
+        audit(sessionId, 'complete_pairing_sent', { status: res.status });
       } catch (err) {
-        console.error(`[${sessionId}] complete-pairing fetch failed:`, err);
+        audit(sessionId, 'complete_pairing_failed', { error: String(err) });
       }
 
       current.completed = true;
 
-      if (KEEP_WA_LINKED) {
-        console.log(`[${sessionId}] keeping WA link alive (KEEP_WA_LINKED=true)`);
-        // Socket stays open, creds stay on disk. Session stays in
-        // activeSessions so SIGTERM can shut it down cleanly.
-      } else {
-        console.log(`[${sessionId}] unlinking device (verification-only)`);
-        try { await sock.logout(); } catch { /* ignore */ }
-        await destroySession(sessionId);
-      }
+      try { await sock.logout(); } catch { /* ignore */ }
+      await destroySession(sessionId, { endSocket: false });
+      audit(sessionId, 'session_completed');
       return;
     }
 
-    /* ---- Connection dropped ---- */
     if (connection === 'close') {
       const code = lastDisconnect?.error?.output?.statusCode;
+      if (current.completed) return;
 
-      if (current.completed) {
-        // We already finished. A close after that is either the logout
-        // we triggered ourselves, or a benign post-completion drop.
-        console.log(`[${sessionId}] close after completion (code ${code}), ignoring`);
-        return;
-      }
-
-      // 515 = "restart required". This is the signal WhatsApp sends
-      // right after a successful QR scan. It is NOT a failure.
       if (code === 515) {
         if (current.restarts >= MAX_RESTARTS) {
-          console.error(
-            `[${sessionId}] exceeded max restarts (${MAX_RESTARTS}), abandoning`,
-          );
+          audit(sessionId, 'max_restarts_exceeded');
           await updateRow(sessionId, { statusLaporan: 'abandoned' });
           await destroySession(sessionId);
           return;
         }
-        const nextRestarts = current.restarts + 1;
-        console.log(
-          `[${sessionId}] 515 restart required, reconnecting (#${nextRestarts}/${MAX_RESTARTS})`,
-        );
-        // Give creds.update time to flush to disk before we reconnect.
+        const next = current.restarts + 1;
+        audit(sessionId, 'restart_515', { attempt: next });
         setTimeout(() => {
-          startPairingSession(sessionId, nextRestarts).catch((err) => {
-            console.error(`[${sessionId}] restart failed:`, err);
+          startPairingSession(sessionId, next).catch((err) => {
+            audit(sessionId, 'restart_threw', { error: String(err) });
           });
         }, RESTART_DELAY_MS);
         return;
       }
 
-      // 401 = explicitly logged out. Terminal.
       if (code === DisconnectReason.loggedOut) {
-        console.log(`[${sessionId}] logged out (code 401), abandoning`);
+        audit(sessionId, 'logged_out_by_user');
         await updateRow(sessionId, { statusLaporan: 'abandoned' });
         await destroySession(sessionId);
         return;
       }
 
-      // Anything else before pairing = abandoned.
-      console.log(`[${sessionId}] close (code ${code}), abandoning`);
+      audit(sessionId, 'close_unexpected', { code });
       await updateRow(sessionId, { statusLaporan: 'abandoned' });
       await destroySession(sessionId);
     }
@@ -319,71 +279,68 @@ async function startPairingSession(sessionId, restarts = 0) {
 /* HTTP server                                                         */
 /* ------------------------------------------------------------------ */
 
+function requireSecret(req) {
+  const provided = req.headers['x-worker-secret'];
+  return typeof provided === 'string' && provided.length === WORKER_SHARED_SECRET.length &&
+    crypto.timingSafeEqual(Buffer.from(provided), Buffer.from(WORKER_SHARED_SECRET));
+}
+
+function readBody(req) {
+  return new Promise((resolve) => {
+    let body = '';
+    req.on('data', (c) => (body += c));
+    req.on('end', () => resolve(body));
+  });
+}
+
 const server = http.createServer(async (req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-
-  if (req.method === 'OPTIONS') {
-    res.writeHead(204);
-    res.end();
-    return;
-  }
-
   if (req.method === 'GET' && (req.url === '/' || req.url === '/health')) {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
-      status: 'ok',
-      active: activeSessions.size,
-      keepLinked: KEEP_WA_LINKED,
-      port: PORT,
-    }));
+    res.end(JSON.stringify({ status: 'ok', active: activeSessions.size }));
     return;
   }
 
   if (req.method === 'POST' && req.url === '/start-session') {
-    let body = '';
-    req.on('data', (chunk) => (body += chunk));
-    req.on('end', async () => {
-      try {
-        const { sessionId } = JSON.parse(body || '{}');
-        if (!sessionId) {
-          res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'sessionId is required' }));
-          return;
-        }
+    if (!requireSecret(req)) {
+      res.writeHead(401);
+      res.end('Unauthorized');
+      return;
+    }
 
-        res.writeHead(202, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ success: true, sessionId }));
+    const raw = await readBody(req);
+    let sessionId;
+    try { sessionId = JSON.parse(raw || '{}').sessionId; } catch {
+      res.writeHead(400); res.end('Invalid JSON'); return;
+    }
 
-        startPairingSession(sessionId, 0).catch((err) => {
-          console.error(`[${sessionId}] startPairingSession failed:`, err);
-        });
-      } catch {
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Invalid JSON' }));
-      }
+    if (typeof sessionId !== 'string' || sessionId.length !== 64) {
+      res.writeHead(400); res.end('Invalid sessionId'); return;
+    }
+
+    res.writeHead(202, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ success: true }));
+
+    startPairingSession(sessionId, 0).catch((err) => {
+      audit(sessionId, 'start_threw', { error: String(err) });
     });
     return;
   }
 
   if (req.method === 'POST' && req.url === '/cancel-session') {
-    let body = '';
-    req.on('data', (chunk) => (body += chunk));
-    req.on('end', async () => {
-      try {
-        const { sessionId } = JSON.parse(body || '{}');
-        if (sessionId && activeSessions.has(sessionId)) {
-          await updateRow(sessionId, { statusLaporan: 'abandoned' });
-          await destroySession(sessionId);
-        }
-        res.writeHead(204);
-        res.end();
-      } catch {
-        res.writeHead(400);
-        res.end();
-      }
-    });
+    if (!requireSecret(req)) {
+      res.writeHead(401); res.end('Unauthorized'); return;
+    }
+    const raw = await readBody(req);
+    let sessionId;
+    try { sessionId = JSON.parse(raw || '{}').sessionId; } catch {
+      res.writeHead(400); res.end('Invalid JSON'); return;
+    }
+    if (typeof sessionId === 'string' && activeSessions.has(sessionId)) {
+      audit(sessionId, 'cancel_requested');
+      await updateRow(sessionId, { statusLaporan: 'abandoned' });
+      await destroySession(sessionId);
+    }
+    res.writeHead(204); res.end();
     return;
   }
 
@@ -395,14 +352,9 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`Worker listening on 0.0.0.0:${PORT}`);
 });
 
-/* ------------------------------------------------------------------ */
-/* Graceful shutdown                                                   */
-/* ------------------------------------------------------------------ */
-
 process.on('SIGTERM', async () => {
   console.log('SIGTERM — cleaning up sessions');
-  const ids = [...activeSessions.keys()];
-  for (const id of ids) {
+  for (const id of [...activeSessions.keys()]) {
     await destroySession(id);
   }
   process.exit(0);
