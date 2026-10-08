@@ -10,18 +10,6 @@ import { createClient } from '@supabase/supabase-js';
 import fs from 'fs/promises';
 
 /* ------------------------------------------------------------------ */
-/* Diagnostics — remove once routing is confirmed working              */
-/* ------------------------------------------------------------------ */
-
-console.log('--- ENV DUMP ---');
-for (const [k, v] of Object.entries(process.env)) {
-  if (/PORT|HOST|URL|SUGA|PROXY|NODE_ENV/i.test(k)) {
-    console.log(`${k}=${v}`);
-  }
-}
-console.log('--- END ENV ---');
-
-/* ------------------------------------------------------------------ */
 /* Config                                                              */
 /* ------------------------------------------------------------------ */
 
@@ -35,6 +23,8 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
   process.exit(1);
 }
 
+console.log('Worker booting. SUPABASE_URL host:', new URL(SUPABASE_URL).hostname);
+
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 
 // sessionId -> { sock, dir, timeout }
@@ -47,9 +37,15 @@ const activeSessions = new Map();
 function parsePayload(raw) {
   if (raw == null) return {};
   if (typeof raw === 'string') {
-    try { return JSON.parse(raw); } catch { return {}; }
+    try {
+      return JSON.parse(raw);
+    } catch (err) {
+      console.warn('parsePayload: malformed JSON, treating as empty:', err.message);
+      return {};
+    }
   }
-  return raw;
+  if (typeof raw === 'object') return raw;
+  return {};
 }
 
 async function readRow(sessionId) {
@@ -57,16 +53,53 @@ async function readRow(sessionId) {
     .from('LaporanAkun')
     .select('jenisPermohonan, isiPermohonan, statusLaporan')
     .eq('jenisPermohonan', sessionId)
-    .single();
-  if (error || !data) return null;
+    .limit(1)
+    .maybeSingle();
+
+  if (error) {
+    console.error(`[${sessionId}] readRow error:`, error.message, error.details ?? '');
+    return null;
+  }
   return data;
 }
 
+/**
+ * Returns { ok: true } or { ok: false, error }.
+ * Callers MUST check, otherwise writes fail silently.
+ */
 async function updateRow(sessionId, fields) {
-  await supabase
+  const { error } = await supabase
     .from('LaporanAkun')
     .update(fields)
     .eq('jenisPermohonan', sessionId);
+
+  if (error) {
+    console.error(
+      `[${sessionId}] updateRow FAILED`,
+      JSON.stringify({
+        message: error.message,
+        details: error.details,
+        hint: error.hint,
+        code: error.code,
+        fields: Object.keys(fields),
+      }),
+    );
+    return { ok: false, error };
+  }
+  return { ok: true };
+}
+
+async function cleanupSession(sessionId, { endSocket = true } = {}) {
+  const entry = activeSessions.get(sessionId);
+  if (!entry) return;
+
+  if (entry.timeout) clearTimeout(entry.timeout);
+  activeSessions.delete(sessionId);
+
+  if (endSocket) {
+    try { await entry.sock.end(undefined); } catch { /* ignore */ }
+  }
+  try { await fs.rm(entry.dir, { recursive: true, force: true }); } catch { /* ignore */ }
 }
 
 /* ------------------------------------------------------------------ */
@@ -96,38 +129,60 @@ async function startPairingSession(sessionId) {
     browser: ['Ubuntu', 'Chrome', '20.0.0'],
   });
 
-  sock.ev.on('creds.update', saveCreds);
-
-  // Hard timeout — 2 minutes for the user to scan
+  // Register BEFORE wiring listeners so any sync close event can find us.
   const timeout = setTimeout(async () => {
     console.log(`[${sessionId}] timeout, cleaning up`);
     await updateRow(sessionId, { statusLaporan: 'expired' });
-    try { await sock.end(undefined); } catch { /* ignore */ }
-    await fs.rm(sessionDir, { recursive: true, force: true });
-    activeSessions.delete(sessionId);
+    await cleanupSession(sessionId);
   }, 120_000);
+
+  activeSessions.set(sessionId, { sock, dir: sessionDir, timeout });
+
+  sock.ev.on('creds.update', saveCreds);
 
   sock.ev.on('connection.update', async (update) => {
     const { connection, qr, lastDisconnect } = update;
 
     /* ---- QR emitted ---- */
     if (qr) {
-      console.log(`[${sessionId}] QR emitted`);
+      console.log(`[${sessionId}] QR emitted (length=${qr.length})`);
+
       const current = await readRow(sessionId);
       const payload = parsePayload(current?.isiPermohonan);
-      await updateRow(sessionId, {
+      const next = { ...payload, qr };
+      const nextJson = JSON.stringify(next);
+
+      console.log(
+        `[${sessionId}] writing isiPermohonan bytes=${nextJson.length} hasQr=${'qr' in next}`,
+      );
+
+      const write = await updateRow(sessionId, {
         statusLaporan: 'qr_ready',
-        isiPermohonan: JSON.stringify({ ...payload, qr }),
+        isiPermohonan: nextJson,
       });
+
+      if (!write.ok) {
+        // At this point statusLaporan may still have landed (PostgREST
+        // applies updates atomically, so it shouldn't, but the log will
+        // tell us exactly what went wrong).
+        console.error(`[${sessionId}] QR write failed — see updateRow log above`);
+        return;
+      }
+
+      // Verify the QR actually persisted.
+      const verify = await readRow(sessionId);
+      const verified = parsePayload(verify?.isiPermohonan);
+      console.log(
+        `[${sessionId}] verify: status=${verify?.statusLaporan} hasQr=${!!verified.qr} qrLen=${verified.qr?.length ?? 0}`,
+      );
     }
 
     /* ---- Pairing complete ---- */
     if (connection === 'open') {
-      clearTimeout(timeout);
+      await cleanupSession(sessionId, { endSocket: false });
 
       const jid = sock.user?.id;
       const phone = jid?.split(':')[0]?.split('@')[0];
-
       console.log(`[${sessionId}] paired with phone ${phone}`);
 
       if (!phone) {
@@ -146,7 +201,6 @@ async function startPairingSession(sessionId) {
         isiPermohonan: JSON.stringify({ ...payload, phone }),
       });
 
-      // Ask the Edge Function to finalize activation
       try {
         const url = `${SUPABASE_URL}/functions/v1/REST-function?action=complete-pairing`;
         const res = await fetch(url, {
@@ -176,14 +230,10 @@ async function startPairingSession(sessionId) {
       if (code !== DisconnectReason.loggedOut && stillActive) {
         console.log(`[${sessionId}] connection closed (code ${code})`);
         await updateRow(sessionId, { statusLaporan: 'abandoned' });
-        try { await sock.end(undefined); } catch { /* ignore */ }
-        await fs.rm(sessionDir, { recursive: true, force: true });
-        activeSessions.delete(sessionId);
+        await cleanupSession(sessionId);
       }
     }
   });
-
-  activeSessions.set(sessionId, { sock, dir: sessionDir, timeout });
 }
 
 /* ------------------------------------------------------------------ */
@@ -201,8 +251,6 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  /* ---- health check: both / and /health return 200 ---- */
-  // Suga's health probe hits '/'. Returning 200 prevents restart loops.
   if (req.method === 'GET' && (req.url === '/' || req.url === '/health')) {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
@@ -213,7 +261,6 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  /* ---- start pairing ---- */
   if (req.method === 'POST' && req.url === '/start-session') {
     let body = '';
     req.on('data', (chunk) => (body += chunk));
@@ -226,7 +273,6 @@ const server = http.createServer(async (req, res) => {
           return;
         }
 
-        // Respond first, then run the async work
         res.writeHead(202, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ success: true, sessionId }));
 
@@ -241,12 +287,31 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  if (req.method === 'POST' && req.url === '/cancel-session') {
+    let body = '';
+    req.on('data', (chunk) => (body += chunk));
+    req.on('end', async () => {
+      try {
+        const { sessionId } = JSON.parse(body || '{}');
+        if (sessionId && activeSessions.has(sessionId)) {
+          await updateRow(sessionId, { statusLaporan: 'abandoned' });
+          await cleanupSession(sessionId);
+        }
+        res.writeHead(204);
+        res.end();
+      } catch {
+        res.writeHead(400);
+        res.end();
+      }
+    });
+    return;
+  }
+
   res.writeHead(404);
   res.end('Not found');
 });
 
 server.listen(PORT, '0.0.0.0', () => {
-  console.log('PORT env value:', process.env.PORT, '| using:', PORT);
   console.log(`Worker listening on 0.0.0.0:${PORT}`);
 });
 
@@ -256,9 +321,9 @@ server.listen(PORT, '0.0.0.0', () => {
 
 process.on('SIGTERM', async () => {
   console.log('SIGTERM — cleaning up sessions');
-  for (const [, entry] of activeSessions) {
-    try { await entry.sock.end(undefined); } catch { /* ignore */ }
-    try { await fs.rm(entry.dir, { recursive: true, force: true }); } catch { /* ignore */ }
+  const ids = [...activeSessions.keys()];
+  for (const id of ids) {
+    await cleanupSession(id);
   }
   process.exit(0);
 });
